@@ -25,16 +25,28 @@
 #include "rom/rtc.h"
 #include <TinyGPS++.h>
 #include <Wire.h>
+#ifdef WIFI
+#include <WiFi.h>
+extern "C" {
+	#include "freertos/FreeRTOS.h"
+	#include "freertos/timers.h"
+}
+#include "credentials.h"
+#include <AsyncMqttClient.h>
+#endif
 
 #include "axp20x.h"
 AXP20X_Class axp;
 bool pmu_irq = false;
 String baChStatus = "No charging";
+bool isOnPower = true;
 
 bool ssd1306_found = false;
 bool axp192_found = false;
 
 bool packetSent, packetQueued;
+
+bool sleepDesired = false;
 
 #if defined(PAYLOAD_USE_FULL)
   // includes number of satellites and accuracy
@@ -42,6 +54,12 @@ bool packetSent, packetQueued;
 #elif defined(PAYLOAD_USE_CAYENNE)
   // CAYENNE DF
   static uint8_t txBuffer[11] = {0x03, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+#endif
+
+#ifdef WIFI
+AsyncMqttClient mqttClient;
+TimerHandle_t mqttReconnectTimer;
+TimerHandle_t wifiReconnectTimer;
 #endif
 
 // deep sleep support
@@ -54,6 +72,10 @@ esp_sleep_source_t wakeCause; // the reason we booted this time
 
 void buildPacket(uint8_t txBuffer[]); // needed for platformio
 
+bool gps_available() {
+  return 0 < gps_hdop() && gps_hdop() < 50 && gps_latitude() != 0 && gps_longitude() != 0 && gps_altitude() != 0;
+}
+
 /**
  * If we have a valid position send it to the server.
  * @return true if we decided to send.
@@ -61,7 +83,7 @@ void buildPacket(uint8_t txBuffer[]); // needed for platformio
 bool trySend() {
   packetSent = false;
   // We also wait for altitude being not exactly zero, because the GPS chip generates a bogus 0 alt report when first powered on
-  if (0 < gps_hdop() && gps_hdop() < 50 && gps_latitude() != 0 && gps_longitude() != 0 && gps_altitude() != 0)
+  if (gps_available())
   {
     char buffer[40];
     snprintf(buffer, sizeof(buffer), "Latitude: %10.6f\n", gps_latitude());
@@ -94,8 +116,21 @@ void doDeepSleep(uint64_t msecToWake)
 {
     Serial.printf("Entering deep sleep for %llu seconds\n", msecToWake / 1000);
 
-    // not using wifi yet, but once we are this is needed to shutoff the radio hw
-    // esp_wifi_stop();
+    #ifdef WIFI
+    sleepDesired = true;
+    xTimerStop(mqttReconnectTimer, 0);
+    xTimerStop(wifiReconnectTimer, 0);
+    if (mqttClient.connected()) {
+      mqttClient.publish(MQTT_TOPIC_LWT, MQTT_QOS, true, "1");
+      delay(100);
+      mqttClient.disconnect();
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.disconnect();
+      delay(100);
+    }
+    #endif
 
     screen_off(); // datasheet says this will draw only 10ua
     LMIC_shutdown(); // cleanly shutdown the radio
@@ -122,10 +157,15 @@ void doDeepSleep(uint64_t msecToWake)
     esp_deep_sleep_start();                              // TBD mA sleep current (battery)
 }
 
-
 void sleep() {
 #if SLEEP_BETWEEN_MESSAGES
-
+  #ifdef NO_SLEEP_WHEN_CHARGING
+  // If the device is charging, we do not sleep.
+  if (isOnPower) {
+    return;
+  }
+  #endif
+  
   // If the user has a screen, tell them we are about to sleep
   if (ssd1306_found) {
     // Show the going to sleep message on the screen
@@ -308,6 +348,55 @@ void initDeepSleep() {
     Serial.printf("booted, wake cause %d (boot count %d)\n", wakeCause, bootCount);
 }
 
+#ifdef WIFI
+void connectToWifi() {
+  if (isOnPower) {
+    Serial.println("[WiFi] Connecting to Wi-Fi...");
+    WiFi.begin(WIFI_SSID, WIFI_PSK);
+  } else {
+    Serial.println("[WiFi] Waiting for power before connecting to wifi.");
+    xTimerStart(wifiReconnectTimer, 0);
+  }
+}
+
+void connectToMqtt() {
+  Serial.println("[MQTT] Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+void WiFiEvent(WiFiEvent_t event) {
+    Serial.printf("[WiFi] event: %d\n", event);
+    switch(event) {
+    case SYSTEM_EVENT_STA_GOT_IP:
+        Serial.println("[WiFi] connected");
+        Serial.println("[WiFi] IP address: ");
+        Serial.println(WiFi.localIP());
+        xTimerStart(mqttReconnectTimer, 0);
+        break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+        Serial.println("[WiFi] lost connection");
+        xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+        if (! sleepDesired) {
+          xTimerStart(wifiReconnectTimer, 0);
+        }
+        break;
+    }
+}
+
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("[MQTT] Connected.");
+  mqttClient.setWill(MQTT_TOPIC_LWT, MQTT_QOS, true, "-1");
+  mqttClient.publish(MQTT_TOPIC_LWT, MQTT_QOS, true, "1");
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("[MQTT] Disconnected.");
+
+  if (WiFi.isConnected() && ! sleepDesired) {
+    xTimerStart(mqttReconnectTimer, 0);
+  }
+}
+#endif
 
 void setup() {
   // Debug
@@ -354,6 +443,18 @@ void setup() {
  }
 #endif
 
+  // Wifi setup
+#ifdef WIFI
+  WiFi.persistent(false);
+  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
+  WiFi.onEvent(WiFiEvent);
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  connectToWifi();
+#endif
+
   // TTN setup
   if (!ttn_setup()) {
     screen_print("[ERR] Radio module not found!\n");
@@ -380,6 +481,8 @@ void loop() {
     packetSent = false;
     sleep();
   }
+
+  isOnPower = axp.isVBUSPlug();
 
   // if user presses button for more than 3 secs, discard our network prefs and reboot (FIXME, use a debounce lib instead of this boilerplate)
   static bool wasPressed = false;
@@ -432,4 +535,33 @@ void loop() {
       delay(100);
     }
   }
+
+  #ifdef WIFI
+  static uint32_t last_mqtt = 0;
+  if (0 == last_mqtt || millis() - last_mqtt > MQTT_SEND_INTERVAL) {
+    last_mqtt = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[MQTT publish] Wifi not connected, skipping.");
+      return;
+    }
+    if (! mqttClient.connected()) {
+      Serial.println("[MQTT publish] MQTT not connected, skipping.");
+      return;
+    }
+    mqttClient.publish(MQTT_TOPIC_SATS, MQTT_QOS, false, String(gps_sats()).c_str());
+    mqttClient.publish(MQTT_TOPIC_BATTERY, MQTT_QOS, false, String(axp.getBattPercentage()).c_str());
+    if (! gps_available()) {
+      Serial.println("[MQTT publish] GPS not available, skipping.");
+      mqttClient.publish(MQTT_TOPIC_LWT, MQTT_QOS, true, "1");
+      return;
+    }
+    mqttClient.publish(MQTT_TOPIC_LWT, MQTT_QOS, true, "2");
+    mqttClient.publish(MQTT_TOPIC_LAT, MQTT_QOS, true, String(gps_latitude(), 6).c_str());
+    mqttClient.publish(MQTT_TOPIC_LON, MQTT_QOS, true, String(gps_longitude(), 6).c_str());
+    mqttClient.publish(MQTT_TOPIC_ALT, MQTT_QOS, false, String(gps_altitude(), 1).c_str());
+    mqttClient.publish(MQTT_TOPIC_SPEED, MQTT_QOS, false, String(gps_speed(), 1).c_str());
+    mqttClient.publish(MQTT_TOPIC_COURSE, MQTT_QOS, false, String(gps_course(), 1).c_str());
+  } 
+
+  #endif
 }

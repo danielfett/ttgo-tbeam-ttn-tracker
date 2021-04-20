@@ -26,6 +26,8 @@ uint32_t LongitudeBinary;
 uint16_t altitudeGps;
 uint8_t hdopGps;
 uint8_t sats;
+uint8_t speedGps;
+uint8_t courseGps;
 char t[32]; // used to sprintf for Serial output
 
 TinyGPSPlus _gps;
@@ -51,6 +53,14 @@ float gps_hdop() {
     return _gps.hdop.hdop();
 }
 
+float gps_speed() {
+    return _gps.speed.kmph();
+}
+
+float gps_course() {
+    return _gps.course.deg();
+}
+
 uint8_t gps_sats() {
     return _gps.satellites.value();
 }
@@ -72,19 +82,15 @@ static void gps_loop() {
     {
         LatitudeBinary = ((_gps.location.lat() + 90) / 180.0) * 16777215;
         LongitudeBinary = ((_gps.location.lng() + 180) / 360.0) * 16777215;
-        altitudeGps = _gps.altitude.meters();
-        hdopGps = _gps.hdop.value() / 10;
-        sats = _gps.satellites.value();
+        altitudeGps = _gps.altitude.meters()/10;
+        speedGps = _gps.speed.kmph();
+        courseGps = _gps.course.deg()/2;
 
         sprintf(t, "Lat: %f", _gps.location.lat());
         Serial.println(t);
         sprintf(t, "Lng: %f", _gps.location.lng());
         Serial.println(t);
         sprintf(t, "Alt: %d", altitudeGps);
-        Serial.println(t);
-        sprintf(t, "Hdop: %d", hdopGps);
-        Serial.println(t);
-        sprintf(t, "Sats: %d", sats);
         Serial.println(t);
 
         txBuffer[0] = ( LatitudeBinary >> 16 ) & 0xFF;
@@ -93,9 +99,9 @@ static void gps_loop() {
         txBuffer[3] = ( LongitudeBinary >> 16 ) & 0xFF;
         txBuffer[4] = ( LongitudeBinary >> 8 ) & 0xFF;
         txBuffer[5] = LongitudeBinary & 0xFF;
-        txBuffer[6] = ( altitudeGps >> 8 ) & 0xFF;
-        txBuffer[7] = altitudeGps & 0xFF;
-        txBuffer[8] = hdopGps & 0xFF;
+        txBuffer[6] = altitudeGps & 0xFF;
+        txBuffer[7] = speedGps & 0xFF;
+        txBuffer[8] = courseGps & 0xFF;
         txBuffer[9] = sats & 0xFF;
     }
 
